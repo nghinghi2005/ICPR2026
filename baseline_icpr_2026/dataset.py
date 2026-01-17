@@ -57,6 +57,20 @@ class AdvancedMultiFrameDataset(Dataset):
         print(f"[{mode.upper()}] Loaded {len(selected_tracks)} tracks.")
         
         self._load_samples(selected_tracks)
+
+    @staticmethod
+    def _normalize_label(raw_label: str) -> str:
+        """Normalize label text to match Config.CHARS.
+
+        - Uppercase
+        - Remove whitespace
+        - Keep only characters present in Config.CHAR2IDX
+        """
+        if not raw_label:
+            return ""
+        normalized = "".join(raw_label.split()).upper()
+        normalized = "".join([c for c in normalized if c in Config.CHAR2IDX])
+        return normalized
     
     def _split_tracks(self, all_tracks, split_ratio):
         """Split tracks into train/val sets, persisting to JSON for reproducibility."""
@@ -114,7 +128,8 @@ class AdvancedMultiFrameDataset(Dataset):
                 if isinstance(data, list):
                     data = data[0]
                 
-                label = data.get('plate_text', data.get('license_plate', data.get('text', '')))
+                raw_label = data.get('plate_text', data.get('license_plate', data.get('text', '')))
+                label = self._normalize_label(raw_label)
                 if not label:
                     continue
 
@@ -152,7 +167,7 @@ class AdvancedMultiFrameDataset(Dataset):
             images_list = self._load_frames(item['lr_paths'], apply_degradation=False)
 
         images_tensor = torch.stack(images_list, dim=0)
-        target = [Config.CHAR2IDX[c] for c in label if c in Config.CHAR2IDX]
+        target = [Config.CHAR2IDX[c] for c in label]
         if len(target) == 0:
             target = [0]
             
