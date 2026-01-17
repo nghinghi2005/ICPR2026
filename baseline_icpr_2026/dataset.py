@@ -2,6 +2,7 @@ import os
 import glob
 import json
 import random
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -25,7 +26,16 @@ class AdvancedMultiFrameDataset(Dataset):
     For training, randomly switches between LR images and HR+degradation.
     """
     
-    def __init__(self, root_dir, mode='train', split_ratio=0.9, test_ratio=0.0):
+    def __init__(
+        self,
+        root_dir,
+        mode='train',
+        split_ratio=0.9,
+        test_ratio=0.0,
+        hr_plus_root: str = "",
+        hr_plus_method: str = "lanczos2",
+        hr_plus_scale: int = 4,
+    ):
         """
         Args:
             root_dir: Path to data directory containing track_* folders
@@ -35,6 +45,9 @@ class AdvancedMultiFrameDataset(Dataset):
         self.mode = mode
         self.split_ratio = float(split_ratio)
         self.test_ratio = float(test_ratio)
+        self.hr_plus_root = str(hr_plus_root or "")
+        self.hr_plus_method = str(hr_plus_method or "lanczos2")
+        self.hr_plus_scale = int(hr_plus_scale)
         self.samples = []
         
         if mode == 'train':
@@ -45,8 +58,8 @@ class AdvancedMultiFrameDataset(Dataset):
             self.degrade = None
 
         print(f"[{mode.upper()}] Scanning: {root_dir}")
-        abs_root = os.path.abspath(root_dir)
-        search_path = os.path.join(abs_root, "**", "track_*")
+        self.abs_root = os.path.abspath(root_dir)
+        search_path = os.path.join(self.abs_root, "**", "track_*")
         all_tracks = sorted(glob.glob(search_path, recursive=True))
         
         if not all_tracks:
@@ -80,6 +93,25 @@ class AdvancedMultiFrameDataset(Dataset):
         normalized = "".join(raw_label.split()).upper()
         normalized = "".join([c for c in normalized if c in Config.CHAR2IDX])
         return normalized
+
+    def _maybe_map_to_hr_plus(self, img_path: str) -> str:
+        """Map an LR frame path to a precomputed HR_plus output path if available."""
+        if not self.hr_plus_root:
+            return img_path
+        try:
+            rel = Path(img_path).resolve().relative_to(Path(self.abs_root).resolve())
+        except Exception:
+            return img_path
+
+        # HR_plus export writes: <hr_plus_root>/x<scale>/<method>/<rel.parent>/<lr_stem>_x<scale>.png
+        out = (
+            Path(self.hr_plus_root)
+            / f"x{int(self.hr_plus_scale)}"
+            / self.hr_plus_method
+            / rel.parent
+            / f"{Path(img_path).stem}_x{int(self.hr_plus_scale)}.png"
+        )
+        return str(out) if out.exists() else img_path
     
     def _split_tracks(self, all_tracks):
         """Split tracks into train/val(/test) sets, persisting to JSON for reproducibility."""
@@ -249,6 +281,9 @@ class AdvancedMultiFrameDataset(Dataset):
         
         images_list = []
         for p in paths:
+            # Use HR_plus only for LR branch (apply_degradation=False).
+            if not apply_degradation:
+                p = self._maybe_map_to_hr_plus(p)
             image = cv2.imread(p)
             if image is None:
                 image = np.zeros((Config.IMG_HEIGHT, Config.IMG_WIDTH, 3), dtype=np.uint8)
