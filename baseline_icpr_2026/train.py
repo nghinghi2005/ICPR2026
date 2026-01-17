@@ -52,6 +52,9 @@ def train_pipeline():
         Config.EVAL_STRIP_CHARS = str(args.eval_strip_chars)
     split_ratio = float(args.split_ratio)
     test_ratio = float(args.test_ratio)
+    hr_plus_root = str(args.hr_plus_root) if args.hr_plus_root else ""
+    hr_plus_method = str(args.hr_plus_method)
+    hr_plus_scale = int(args.hr_plus_scale)
 
     output_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -83,6 +86,9 @@ def train_pipeline():
         "val_split_file": os.path.abspath(Config.VAL_SPLIT_FILE),
         "test_split_file": os.path.abspath(Config.TEST_SPLIT_FILE),
         "eval_strip_chars": str(getattr(Config, "EVAL_STRIP_CHARS", "")),
+        "hr_plus_root": hr_plus_root,
+        "hr_plus_method": hr_plus_method,
+        "hr_plus_scale": hr_plus_scale,
     }
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as f:
         json.dump(run_meta, f, indent=2)
@@ -101,13 +107,45 @@ def train_pipeline():
             batch_size=Config.BATCH_SIZE,
             num_workers=Config.NUM_WORKERS,
             eval_on=args.eval_on,
+            hr_plus_root=hr_plus_root,
+            hr_plus_method=hr_plus_method,
+            hr_plus_scale=hr_plus_scale,
+            eval_results_json=args.eval_results_json,
         )
         return
 
     # Create datasets
-    train_ds = AdvancedMultiFrameDataset(Config.DATA_ROOT, mode='train', split_ratio=split_ratio, test_ratio=test_ratio)
-    val_ds = AdvancedMultiFrameDataset(Config.DATA_ROOT, mode='val', split_ratio=split_ratio, test_ratio=test_ratio)
-    test_ds = AdvancedMultiFrameDataset(Config.DATA_ROOT, mode='test', split_ratio=split_ratio, test_ratio=test_ratio) if test_ratio > 0 else None
+    train_ds = AdvancedMultiFrameDataset(
+        Config.DATA_ROOT,
+        mode='train',
+        split_ratio=split_ratio,
+        test_ratio=test_ratio,
+        hr_plus_root=hr_plus_root,
+        hr_plus_method=hr_plus_method,
+        hr_plus_scale=hr_plus_scale,
+    )
+    val_ds = AdvancedMultiFrameDataset(
+        Config.DATA_ROOT,
+        mode='val',
+        split_ratio=split_ratio,
+        test_ratio=test_ratio,
+        hr_plus_root=hr_plus_root,
+        hr_plus_method=hr_plus_method,
+        hr_plus_scale=hr_plus_scale,
+    )
+    test_ds = (
+        AdvancedMultiFrameDataset(
+            Config.DATA_ROOT,
+            mode='test',
+            split_ratio=split_ratio,
+            test_ratio=test_ratio,
+            hr_plus_root=hr_plus_root,
+            hr_plus_method=hr_plus_method,
+            hr_plus_scale=hr_plus_scale,
+        )
+        if test_ratio > 0
+        else None
+    )
     
     if len(train_ds) == 0: 
         print("❌ Dataset Train rỗng!")
@@ -376,6 +414,10 @@ def _run_eval_only(
     batch_size: int,
     num_workers: int,
     eval_on: str,
+    hr_plus_root: str,
+    hr_plus_method: str,
+    hr_plus_scale: int,
+    eval_results_json: str,
 ):
     if not os.path.exists(data_root):
         print(f"❌ LỖI: Sai đường dẫn DATA_ROOT: {data_root}")
@@ -390,6 +432,9 @@ def _run_eval_only(
         mode=eval_on,
         split_ratio=split_ratio,
         test_ratio=test_ratio,
+        hr_plus_root=hr_plus_root,
+        hr_plus_method=hr_plus_method,
+        hr_plus_scale=hr_plus_scale,
     )
     if len(ds) == 0:
         print(f"❌ {eval_on} dataset is empty. If you want test evaluation, set --test-ratio > 0.")
@@ -405,12 +450,16 @@ def _run_eval_only(
     )
 
     model = MultiFrameCRNN(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
-    out_name = "test_results.json" if eval_on == "test" else "val_results.json"
+    if eval_results_json:
+        out_path = eval_results_json
+    else:
+        out_name = "test_results.json" if eval_on == "test" else "val_results.json"
+        out_path = str(output_dir / out_name)
     _evaluate_and_save(
         model=model,
         checkpoint_path=checkpoint_path,
         loader=loader,
-        output_path=str(output_dir / out_name),
+        output_path=out_path,
         title=eval_on.upper(),
     )
 
@@ -439,6 +488,30 @@ def _parse_args() -> argparse.Namespace:
         default="test",
         choices=["val", "test"],
         help="Which split to evaluate in eval-only mode.",
+    )
+    p.add_argument(
+        "--eval-results-json",
+        type=str,
+        default="",
+        help="Path to write evaluation JSON (eval-only). Defaults to <output-dir>/(test|val)_results.json",
+    )
+    p.add_argument(
+        "--hr-plus-root",
+        type=str,
+        default="",
+        help="Root folder that contains HR_plus outputs (expects x<scale>/<method>/... structure).",
+    )
+    p.add_argument(
+        "--hr-plus-method",
+        type=str,
+        default="lanczos2",
+        help="HR_plus method subfolder name (e.g. lanczos2, denoise_clahe_sharpen).",
+    )
+    p.add_argument(
+        "--hr-plus-scale",
+        type=int,
+        default=4,
+        help="HR_plus scale factor used in folder naming (expects x<scale>).",
     )
     return p.parse_args()
 
