@@ -25,7 +25,7 @@ class AdvancedMultiFrameDataset(Dataset):
     For training, randomly switches between LR images and HR+degradation.
     """
     
-    def __init__(self, root_dir, mode='train', split_ratio=0.9):
+    def __init__(self, root_dir, mode='train', split_ratio=0.9, test_ratio=0.0):
         """
         Args:
             root_dir: Path to data directory containing track_* folders
@@ -33,6 +33,8 @@ class AdvancedMultiFrameDataset(Dataset):
             split_ratio: Ratio of data to use for training
         """
         self.mode = mode
+        self.split_ratio = float(split_ratio)
+        self.test_ratio = float(test_ratio)
         self.samples = []
         
         if mode == 'train':
@@ -51,9 +53,16 @@ class AdvancedMultiFrameDataset(Dataset):
             print("❌ LỖI: Không tìm thấy data.")
             return
 
-        train_tracks, val_tracks = self._split_tracks(all_tracks, split_ratio)
+        train_tracks, val_tracks, test_tracks = self._split_tracks(all_tracks)
         
-        selected_tracks = train_tracks if mode == 'train' else val_tracks
+        if mode == 'train':
+            selected_tracks = train_tracks
+        elif mode == 'val':
+            selected_tracks = val_tracks
+        elif mode == 'test':
+            selected_tracks = test_tracks
+        else:
+            raise ValueError("mode must be one of: 'train', 'val', 'test'")
         print(f"[{mode.upper()}] Loaded {len(selected_tracks)} tracks.")
         
         self._load_samples(selected_tracks)
@@ -72,48 +81,107 @@ class AdvancedMultiFrameDataset(Dataset):
         normalized = "".join([c for c in normalized if c in Config.CHAR2IDX])
         return normalized
     
-    def _split_tracks(self, all_tracks, split_ratio):
-        """Split tracks into train/val sets, persisting to JSON for reproducibility."""
-        train_tracks = []
-        val_tracks = []
-        
-        if os.path.exists(Config.VAL_SPLIT_FILE):
-            print(f"📂 Loading split from '{Config.VAL_SPLIT_FILE}'...")
+    def _split_tracks(self, all_tracks):
+        """Split tracks into train/val(/test) sets, persisting to JSON for reproducibility."""
+        train_tracks: list[str] = []
+        val_tracks: list[str] = []
+        test_tracks: list[str] = []
+
+        want_test = self.test_ratio > 0
+        val_exists = os.path.exists(Config.VAL_SPLIT_FILE)
+        test_exists = os.path.exists(getattr(Config, "TEST_SPLIT_FILE", "")) if want_test else False
+
+        # If we want a test split, require both split files; otherwise, create a fresh 3-way split.
+        # This avoids silently changing only part of the split.
+        should_load = val_exists and ((not want_test) or test_exists)
+
+        if should_load:
+            if want_test:
+                print(f"📂 Loading splits from '{Config.VAL_SPLIT_FILE}' and '{Config.TEST_SPLIT_FILE}'...")
+            else:
+                print(f"📂 Loading split from '{Config.VAL_SPLIT_FILE}'...")
+
             try:
                 with open(Config.VAL_SPLIT_FILE, 'r') as f:
                     val_ids = set(json.load(f))
+                test_ids = set()
+                if want_test:
+                    with open(Config.TEST_SPLIT_FILE, 'r') as f:
+                        test_ids = set(json.load(f))
             except:
                 val_ids = set()
+                test_ids = set()
                 print("⚠️ Lỗi đọc file split, sẽ tạo lại.")
+                should_load = False
 
-            for t in all_tracks:
-                track_name = os.path.basename(t)
-                if track_name in val_ids:
-                    val_tracks.append(t)
-                else:
-                    train_tracks.append(t)
-            
-            if not val_tracks and len(all_tracks) > 0:
-                print("⚠️ File split không khớp với dữ liệu hiện tại. Chia lại...")
-                train_tracks, val_tracks = self._create_new_split(all_tracks, split_ratio)
-        else:
-            print("⚠️ Creating new split...")
-            train_tracks, val_tracks = self._create_new_split(all_tracks, split_ratio)
-        
-        return train_tracks, val_tracks
+            if should_load:
+                for t in all_tracks:
+                    track_name = os.path.basename(t)
+                    if track_name in val_ids:
+                        val_tracks.append(t)
+                    elif want_test and track_name in test_ids:
+                        test_tracks.append(t)
+                    else:
+                        train_tracks.append(t)
+
+                # If splits don't match current data, recreate
+                if (not val_tracks) or (want_test and not test_tracks):
+                    print("⚠️ File split không khớp với dữ liệu hiện tại. Chia lại...")
+                    should_load = False
+
+        if not should_load:
+            if want_test:
+                print("⚠️ Creating new train/val/test split...")
+                train_tracks, val_tracks, test_tracks = self._create_new_split_3way(all_tracks)
+            else:
+                print("⚠️ Creating new train/val split...")
+                train_tracks, val_tracks = self._create_new_split_2way(all_tracks)
+                test_tracks = []
+
+        return train_tracks, val_tracks, test_tracks
     
-    def _create_new_split(self, all_tracks, split_ratio):
+    def _create_new_split_2way(self, all_tracks):
         """Create a new train/val split and save to JSON."""
+        all_tracks = list(all_tracks)
         random.Random(Config.SEED).shuffle(all_tracks)
-        split_idx = int(len(all_tracks) * split_ratio)
+        split_idx = int(len(all_tracks) * self.split_ratio)
         train_tracks = all_tracks[:split_idx]
         val_tracks = all_tracks[split_idx:]
-        
+
         val_ids = [os.path.basename(t) for t in val_tracks]
         with open(Config.VAL_SPLIT_FILE, 'w') as f:
             json.dump(val_ids, f, indent=2)
-        
+
         return train_tracks, val_tracks
+
+    def _create_new_split_3way(self, all_tracks):
+        """Create a new train/val/test split and save to JSON."""
+        if not getattr(Config, "TEST_SPLIT_FILE", ""):
+            raise ValueError("Config.TEST_SPLIT_FILE must be set when using test_ratio")
+
+        all_tracks = list(all_tracks)
+        random.Random(Config.SEED).shuffle(all_tracks)
+
+        if self.test_ratio < 0 or self.split_ratio <= 0 or (self.split_ratio + self.test_ratio) >= 1:
+            raise ValueError("Invalid split ratios: require split_ratio > 0, test_ratio >= 0, split_ratio + test_ratio < 1")
+
+        n = len(all_tracks)
+        n_train = int(n * self.split_ratio)
+        n_test = int(n * self.test_ratio)
+        n_val = n - n_train - n_test
+
+        train_tracks = all_tracks[:n_train]
+        val_tracks = all_tracks[n_train : n_train + n_val]
+        test_tracks = all_tracks[n_train + n_val :]
+
+        val_ids = [os.path.basename(t) for t in val_tracks]
+        test_ids = [os.path.basename(t) for t in test_tracks]
+        with open(Config.VAL_SPLIT_FILE, 'w') as f:
+            json.dump(val_ids, f, indent=2)
+        with open(Config.TEST_SPLIT_FILE, 'w') as f:
+            json.dump(test_ids, f, indent=2)
+
+        return train_tracks, val_tracks, test_tracks
     
     def _load_samples(self, tracks):
         """Load sample metadata from track directories."""
@@ -168,8 +236,6 @@ class AdvancedMultiFrameDataset(Dataset):
 
         images_tensor = torch.stack(images_list, dim=0)
         target = [Config.CHAR2IDX[c] for c in label]
-        if len(target) == 0:
-            target = [0]
             
         return images_tensor, torch.tensor(target, dtype=torch.long), len(target), label
     
