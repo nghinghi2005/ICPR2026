@@ -48,13 +48,17 @@ def train_pipeline():
         Config.BATCH_SIZE = int(args.batch_size)
     if args.num_workers is not None:
         Config.NUM_WORKERS = int(args.num_workers)
+    if args.eval_strip_chars is not None:
+        Config.EVAL_STRIP_CHARS = str(args.eval_strip_chars)
     split_ratio = float(args.split_ratio)
+    test_ratio = float(args.test_ratio)
 
     output_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Keep split file per-run to avoid cross-run leakage
     Config.VAL_SPLIT_FILE = str(output_dir / "val_tracks.json")
+    Config.TEST_SPLIT_FILE = str(output_dir / "test_tracks.json")
 
     seed_everything(Config.SEED)
     print(f"🚀 TRAINING START | Device: {Config.DEVICE} | Output: {output_dir}")
@@ -75,14 +79,35 @@ def train_pipeline():
         "seed": int(Config.SEED),
         "device": str(Config.DEVICE),
         "split_ratio": split_ratio,
+        "test_ratio": test_ratio,
         "val_split_file": os.path.abspath(Config.VAL_SPLIT_FILE),
+        "test_split_file": os.path.abspath(Config.TEST_SPLIT_FILE),
+        "eval_strip_chars": str(getattr(Config, "EVAL_STRIP_CHARS", "")),
     }
     with open(output_dir / "run_config.json", "w", encoding="utf-8") as f:
         json.dump(run_meta, f, indent=2)
 
+    # Eval-only: run evaluation from a checkpoint without training
+    if args.eval_only:
+        ckpt_path = args.checkpoint
+        if not ckpt_path:
+            ckpt_path = str(output_dir / "best_model.pth")
+        _run_eval_only(
+            checkpoint_path=ckpt_path,
+            data_root=Config.DATA_ROOT,
+            output_dir=output_dir,
+            split_ratio=split_ratio,
+            test_ratio=test_ratio,
+            batch_size=Config.BATCH_SIZE,
+            num_workers=Config.NUM_WORKERS,
+            eval_on=args.eval_on,
+        )
+        return
+
     # Create datasets
-    train_ds = AdvancedMultiFrameDataset(Config.DATA_ROOT, mode='train', split_ratio=split_ratio)
-    val_ds = AdvancedMultiFrameDataset(Config.DATA_ROOT, mode='val', split_ratio=split_ratio)
+    train_ds = AdvancedMultiFrameDataset(Config.DATA_ROOT, mode='train', split_ratio=split_ratio, test_ratio=test_ratio)
+    val_ds = AdvancedMultiFrameDataset(Config.DATA_ROOT, mode='val', split_ratio=split_ratio, test_ratio=test_ratio)
+    test_ds = AdvancedMultiFrameDataset(Config.DATA_ROOT, mode='test', split_ratio=split_ratio, test_ratio=test_ratio) if test_ratio > 0 else None
     
     if len(train_ds) == 0: 
         print("❌ Dataset Train rỗng!")
@@ -110,6 +135,17 @@ def train_pipeline():
     else:
         print("⚠️ CẢNH BÁO: Validation Set rỗng. Sẽ bỏ qua bước validate.")
         val_loader = None
+
+    test_loader = None
+    if test_ds is not None and len(test_ds) > 0:
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=Config.BATCH_SIZE,
+            shuffle=False,
+            collate_fn=AdvancedMultiFrameDataset.collate_fn,
+            num_workers=Config.NUM_WORKERS,
+            pin_memory=True,
+        )
 
     # Initialize model, loss, optimizer
     model = MultiFrameCRNN(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
@@ -200,8 +236,17 @@ def train_pipeline():
                     val_loss += loss.item()
                     
                     decoded = decode_predictions(torch.argmax(preds, dim=2), Config.IDX2CHAR)
+                    strip_chars = str(getattr(Config, "EVAL_STRIP_CHARS", ""))
                     for i in range(len(labels_text)):
-                        if decoded[i] == labels_text[i]:
+                        pred_text = decoded[i]
+                        gt_text = labels_text[i]
+
+                        if strip_chars:
+                            for ch in strip_chars:
+                                pred_text = pred_text.replace(ch, "")
+                                gt_text = gt_text.replace(ch, "")
+
+                        if pred_text == gt_text:
                             total_correct += 1
                     total_samples += len(labels_text)
 
@@ -234,6 +279,141 @@ def train_pipeline():
                 }
             )
 
+    # Optional: Evaluate best checkpoint on test split
+    if args.run_test:
+        if test_loader is None:
+            print("⚠️ Test loader is empty. Set --test-ratio > 0 to create a test split.")
+        else:
+            best_path = output_dir / "best_model.pth"
+            if not best_path.exists():
+                print("⚠️ best_model.pth not found; skipping test evaluation.")
+            else:
+                _evaluate_and_save(
+                    model=model,
+                    checkpoint_path=str(best_path),
+                    loader=test_loader,
+                    output_path=str(output_dir / "test_results.json"),
+                    title="TEST",
+                )
+
+
+def _apply_eval_strip(text: str) -> str:
+    strip_chars = str(getattr(Config, "EVAL_STRIP_CHARS", ""))
+    if not strip_chars:
+        return text
+    for ch in strip_chars:
+        text = text.replace(ch, "")
+    return text
+
+
+def _evaluate_and_save(model, checkpoint_path: str, loader, output_path: str, title: str):
+    try:
+        state = torch.load(checkpoint_path, map_location=Config.DEVICE, weights_only=True)
+    except TypeError:
+        state = torch.load(checkpoint_path, map_location=Config.DEVICE)
+    model.load_state_dict(state)
+    model.eval()
+
+    exact_correct = 0
+    total = 0
+    char_correct = 0
+    char_total = 0
+    sample_errors = []
+
+    with torch.no_grad():
+        for images, _, _, labels_text in tqdm(loader, desc=f"Evaluating {title}"):
+            images = images.to(Config.DEVICE)
+            preds = model(images)
+            decoded = decode_predictions(torch.argmax(preds, dim=2), Config.IDX2CHAR)
+
+            for i in range(len(labels_text)):
+                gt = _apply_eval_strip(labels_text[i])
+                pred = _apply_eval_strip(decoded[i])
+
+                if pred == gt:
+                    exact_correct += 1
+                total += 1
+
+                # Character-level accuracy (position-wise, up to max length)
+                m = max(len(gt), len(pred))
+                for j in range(m):
+                    char_total += 1
+                    if j < len(gt) and j < len(pred) and gt[j] == pred[j]:
+                        char_correct += 1
+
+                if pred != gt and len(sample_errors) < 20:
+                    sample_errors.append({"gt": gt, "pred": pred})
+
+    exact_acc = (exact_correct / total) * 100 if total else 0.0
+    char_acc = (char_correct / char_total) * 100 if char_total else 0.0
+
+    result = {
+        "split": title,
+        "checkpoint": os.path.abspath(checkpoint_path),
+        "exact_match_acc": exact_acc,
+        "char_acc": char_acc,
+        "total_samples": total,
+        "correct_samples": exact_correct,
+        "eval_strip_chars": str(getattr(Config, "EVAL_STRIP_CHARS", "")),
+        "sample_errors": sample_errors,
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+
+    print(f"\n📊 {title} RESULTS:")
+    print(f"   • Exact Match Accuracy: {exact_acc:.2f}% ({exact_correct}/{total})")
+    print(f"   • Character Accuracy:   {char_acc:.2f}%")
+    print(f"💾 Saved: {output_path}")
+
+
+def _run_eval_only(
+    checkpoint_path: str,
+    data_root: str,
+    output_dir: Path,
+    split_ratio: float,
+    test_ratio: float,
+    batch_size: int,
+    num_workers: int,
+    eval_on: str,
+):
+    if not os.path.exists(data_root):
+        print(f"❌ LỖI: Sai đường dẫn DATA_ROOT: {data_root}")
+        return
+
+    if not os.path.exists(checkpoint_path):
+        print(f"❌ Checkpoint not found: {checkpoint_path}")
+        return
+
+    ds = AdvancedMultiFrameDataset(
+        data_root,
+        mode=eval_on,
+        split_ratio=split_ratio,
+        test_ratio=test_ratio,
+    )
+    if len(ds) == 0:
+        print(f"❌ {eval_on} dataset is empty. If you want test evaluation, set --test-ratio > 0.")
+        return
+
+    loader = DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=AdvancedMultiFrameDataset.collate_fn,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    model = MultiFrameCRNN(num_classes=Config.NUM_CLASSES).to(Config.DEVICE)
+    out_name = "test_results.json" if eval_on == "test" else "val_results.json"
+    _evaluate_and_save(
+        model=model,
+        checkpoint_path=checkpoint_path,
+        loader=loader,
+        output_path=str(output_dir / out_name),
+        title=eval_on.upper(),
+    )
+
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train Multi-Frame CRNN baseline (CTC).")
@@ -243,6 +423,23 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=None, help="Override Config.BATCH_SIZE")
     p.add_argument("--num-workers", type=int, default=None, help="Override Config.NUM_WORKERS")
     p.add_argument("--split-ratio", type=float, default=0.8, help="Train split ratio (val = 1 - ratio).")
+    p.add_argument("--test-ratio", type=float, default=0.0, help="Test split ratio (0 disables test split).")
+    p.add_argument("--run-test", action="store_true", help="After training, evaluate best_model.pth on test split.")
+    p.add_argument(
+        "--eval-strip-chars",
+        type=str,
+        default=None,
+        help="Characters to strip from pred/gt strings when computing val_acc (evaluation only).",
+    )
+    p.add_argument("--checkpoint", type=str, default="", help="Checkpoint path for eval-only.")
+    p.add_argument("--eval-only", action="store_true", help="Skip training; run evaluation from checkpoint.")
+    p.add_argument(
+        "--eval-on",
+        type=str,
+        default="test",
+        choices=["val", "test"],
+        help="Which split to evaluate in eval-only mode.",
+    )
     return p.parse_args()
 
 
