@@ -8,6 +8,7 @@ class Config:
     # Data paths
     DATA_ROOT = "data/train"
     VAL_SPLIT_FILE = "val_tracks.json"
+    TEST_SPLIT_FILE = "test_tracks.json"
     
     # Image settings
     IMG_HEIGHT = 32
@@ -15,6 +16,12 @@ class Config:
     
     # Character set
     CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-"
+
+    # Evaluation-only normalization
+    # If set, these characters are removed from BOTH prediction and ground-truth
+    # strings before computing exact-match val_acc (training is unaffected).
+    # Example: "-" to ignore printed hyphens that are not part of labels.
+    EVAL_STRIP_CHARS = ""
     
     # Training hyperparameters
     BATCH_SIZE = 64
