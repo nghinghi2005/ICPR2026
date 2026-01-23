@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 from .config import SRConfig
 from .data import PairedLRHRPatchDataset, SRPatchDataset
