@@ -61,6 +61,7 @@ class MultiFrameTrackDataset(Dataset):
         char2idx: dict,
         mode: str = "train",
         split_ratio: float = 0.9,
+        test_ratio: float = 0.0,
         seed: int = 42,
         frames_per_sample: int = 5,
         img_hw: Tuple[int, int] = (32, 128),
@@ -86,8 +87,22 @@ class MultiFrameTrackDataset(Dataset):
         if not tracks:
             raise RuntimeError(f"No track_* found under: {self.data_root}")
 
-        train_tracks, val_tracks = self._split(tracks, split_ratio=split_ratio, seed=seed, split_file=split_file)
-        selected = train_tracks if mode == "train" else val_tracks
+        train_tracks, val_tracks, test_tracks = self._split(
+            tracks,
+            split_ratio=split_ratio,
+            test_ratio=test_ratio,
+            seed=seed,
+            split_file=split_file,
+        )
+
+        if mode == "train":
+            selected = train_tracks
+        elif mode == "val":
+            selected = val_tracks
+        elif mode == "test":
+            selected = test_tracks
+        else:
+            raise ValueError("mode must be one of: train, val, test")
 
         for track_dir in selected:
             ann = os.path.join(track_dir, "annotations.json")
@@ -115,31 +130,82 @@ class MultiFrameTrackDataset(Dataset):
         if not self.samples:
             raise RuntimeError(f"No usable samples for mode={mode}")
 
-    def _split(self, tracks: Sequence[str], split_ratio: float, seed: int, split_file: Optional[str]):
+    def _split(self, tracks: Sequence[str], split_ratio: float, test_ratio: float, seed: int, split_file: Optional[str]):
         tracks = list(tracks)
         rng = random.Random(int(seed))
 
+        train_ratio = float(split_ratio)
+        test_ratio = float(test_ratio)
+        if train_ratio <= 0 or train_ratio >= 1:
+            raise ValueError("split_ratio (train ratio) must be in (0, 1)")
+        if test_ratio < 0 or test_ratio >= 1:
+            raise ValueError("test_ratio must be in [0, 1)")
+        val_ratio = 1.0 - train_ratio - test_ratio
+        if val_ratio <= 0:
+            raise ValueError("val_ratio must be > 0; adjust split_ratio/test_ratio")
+
         if split_file and os.path.exists(split_file):
             with open(split_file, "r", encoding="utf-8") as f:
-                val_names = set(json.load(f))
-            train, val = [], []
+                data = json.load(f)
+
+            # Backward compatible:
+            # - list: val tracks only
+            # - dict: {"val": [...], "test": [...]} (train is the remainder)
+            if isinstance(data, list):
+                val_names = set(data)
+                test_names: set[str] = set()
+            elif isinstance(data, dict):
+                val_names = set(data.get("val", []) or [])
+                test_names = set(data.get("test", []) or [])
+            else:
+                val_names = set()
+                test_names = set()
+
+            train, val, test = [], [], []
             for t in tracks:
                 if os.path.basename(t) in val_names:
                     val.append(t)
+                elif os.path.basename(t) in test_names:
+                    test.append(t)
                 else:
                     train.append(t)
-            if train and val:
-                return train, val
+
+            # Only accept persisted splits when non-empty for requested structure
+            if train and val and (test_ratio <= 0 or test):
+                return train, val, test
 
         rng.shuffle(tracks)
-        split_idx = int(len(tracks) * float(split_ratio))
-        train, val = tracks[:split_idx], tracks[split_idx:]
+        n = len(tracks)
+        n_train = int(n * train_ratio)
+        n_val = int(n * val_ratio)
+        train = tracks[:n_train]
+        val = tracks[n_train : n_train + n_val]
+        test = tracks[n_train + n_val :]
+
+        # If test_ratio == 0, collapse into val
+        if test_ratio <= 0:
+            val = val + test
+            test = []
 
         if split_file:
             with open(split_file, "w", encoding="utf-8") as f:
-                json.dump([os.path.basename(t) for t in val], f, indent=2)
+                if test:
+                    json.dump(
+                        {
+                            "val": [os.path.basename(t) for t in val],
+                            "test": [os.path.basename(t) for t in test],
+                            "seed": int(seed),
+                            "train_ratio": train_ratio,
+                            "val_ratio": val_ratio,
+                            "test_ratio": test_ratio,
+                        },
+                        f,
+                        indent=2,
+                    )
+                else:
+                    json.dump([os.path.basename(t) for t in val], f, indent=2)
 
-        return train, val
+        return train, val, test
 
     def _normalize_label(self, s: str) -> str:
         s = "".join(s.split()).upper()
