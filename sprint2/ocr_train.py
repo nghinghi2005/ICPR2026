@@ -31,13 +31,74 @@ def _accuracy(preds, gts):
     return correct / max(1, len(gts))
 
 
+def _char_accuracy(preds, gts) -> float:
+    # Match baseline-style: compare up to max length of each pair.
+    total = 0
+    correct = 0
+    for p, g in zip(preds, gts):
+        m = max(len(p), len(g))
+        if m == 0:
+            continue
+        total += m
+        for i in range(m):
+            if i < len(p) and i < len(g) and p[i] == g[i]:
+                correct += 1
+    return correct / max(1, total)
+
+
+def _edit_distance(a: str, b: str) -> int:
+    # Levenshtein distance (iterative, O(min(n,m)) memory)
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+
+    # Ensure a is the shorter string
+    if len(a) > len(b):
+        a, b = b, a
+
+    prev = list(range(len(a) + 1))
+    for j, bj in enumerate(b, start=1):
+        cur = [j]
+        for i, ai in enumerate(a, start=1):
+            ins = cur[i - 1] + 1
+            dele = prev[i] + 1
+            sub = prev[i - 1] + (0 if ai == bj else 1)
+            cur.append(min(ins, dele, sub))
+        prev = cur
+    return prev[-1]
+
+
+def _summarize(preds, gts) -> Dict[str, float]:
+    exact = _accuracy(preds, gts)
+    char_acc = _char_accuracy(preds, gts)
+    dists = [_edit_distance(p, g) for p, g in zip(preds, gts)]
+    avg_ed = float(sum(dists) / max(1, len(dists)))
+    norm = []
+    for (p, g), d in zip(zip(preds, gts), dists):
+        denom = max(1, max(len(p), len(g)))
+        norm.append(d / denom)
+    avg_norm_ed = float(sum(norm) / max(1, len(norm)))
+    return {
+        "exact_match_acc": float(exact),
+        "char_acc": float(char_acc),
+        "avg_edit_distance": float(avg_ed),
+        "avg_norm_edit_distance": float(avg_norm_ed),
+        "n": float(len(gts)),
+    }
+
+
 def train_ocr(
     cfg: OCRConfig,
     out_dir: Optional[Path] = None,
     hr_plus_root: str = "",
     hr_plus_scale: int = 2,
     split_ratio: float = 0.9,
+    test_ratio: float = 0.0,
     prefer_template: Optional[str] = None,
+    beam_size: int = 10,
 ) -> Dict[str, str]:
     """Train OCR model with CTC; decode with template constraints."""
 
@@ -56,13 +117,14 @@ def train_ocr(
     use_amp = bool(cfg.amp and device.type == "cuda")
     scaler = GradScaler(enabled=use_amp)
 
-    split_file = str(out_dir / "val_tracks.json")
+    split_file = str(out_dir / "splits.json")
 
     train_ds = MultiFrameTrackDataset(
         cfg.data_root,
         char2idx=cfg.char2idx,
         mode="train",
         split_ratio=split_ratio,
+        test_ratio=test_ratio,
         seed=cfg.seed,
         frames_per_sample=cfg.frames_per_sample,
         img_hw=(cfg.img_height, cfg.img_width),
@@ -76,6 +138,7 @@ def train_ocr(
         char2idx=cfg.char2idx,
         mode="val",
         split_ratio=split_ratio,
+        test_ratio=test_ratio,
         seed=cfg.seed,
         frames_per_sample=cfg.frames_per_sample,
         img_hw=(cfg.img_height, cfg.img_width),
@@ -84,6 +147,31 @@ def train_ocr(
         hr_plus_scale=hr_plus_scale,
         split_file=split_file,
     )
+
+    test_loader = None
+    if float(test_ratio) > 0:
+        test_ds = MultiFrameTrackDataset(
+            cfg.data_root,
+            char2idx=cfg.char2idx,
+            mode="test",
+            split_ratio=split_ratio,
+            test_ratio=test_ratio,
+            seed=cfg.seed,
+            frames_per_sample=cfg.frames_per_sample,
+            img_hw=(cfg.img_height, cfg.img_width),
+            eval_strip_chars=cfg.eval_strip_chars,
+            hr_plus_root=hr_plus_root,
+            hr_plus_scale=hr_plus_scale,
+            split_file=split_file,
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=True,
+            collate_fn=MultiFrameTrackDataset.collate_fn,
+        )
 
     train_loader = DataLoader(
         train_ds,
@@ -116,7 +204,18 @@ def train_ocr(
 
     metrics_path = out_dir / "metrics.csv"
     with open(metrics_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss", "val_acc", "val_acc_constrained"])
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "epoch",
+                "train_loss",
+                "val_loss",
+                "val_acc",
+                "val_acc_constrained",
+                "val_char_acc",
+                "val_char_acc_constrained",
+            ],
+        )
         w.writeheader()
 
     best_acc = 0.0
@@ -194,7 +293,7 @@ def train_ocr(
                 constrained = decode_with_plate_constraints(
                     log_probs.cpu(),
                     idx2char=cfg.idx2char,
-                    beam_size=10,
+                    beam_size=int(beam_size),
                     prefer_template=prefer_template,
                     eval_strip=cfg.eval_strip_chars,
                 )
@@ -206,9 +305,22 @@ def train_ocr(
         val_loss = val_loss / max(1, len(val_loader))
         val_acc = _accuracy(all_pred_greedy, all_gt)
         val_acc_c = _accuracy(all_pred_constrained, all_gt)
+        val_char_acc = _char_accuracy(all_pred_greedy, all_gt)
+        val_char_acc_c = _char_accuracy(all_pred_constrained, all_gt)
 
         with open(metrics_path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "val_loss", "val_acc", "val_acc_constrained"])
+            w = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "epoch",
+                    "train_loss",
+                    "val_loss",
+                    "val_acc",
+                    "val_acc_constrained",
+                    "val_char_acc",
+                    "val_char_acc_constrained",
+                ],
+            )
             w.writerow(
                 {
                     "epoch": epoch + 1,
@@ -216,6 +328,8 @@ def train_ocr(
                     "val_loss": val_loss,
                     "val_acc": val_acc,
                     "val_acc_constrained": val_acc_c,
+                    "val_char_acc": val_char_acc,
+                    "val_char_acc_constrained": val_char_acc_c,
                 }
             )
 
@@ -238,8 +352,80 @@ def train_ocr(
         with open(sample_path, "w", encoding="utf-8") as f:
             json.dump(samples, f, indent=2)
 
+    # Final evaluation summary: best checkpoint on val/test with greedy vs constrained
+    eval_summary = {
+        "best_ckpt": str(best_ckpt),
+        "best_val_acc_constrained": float(best_acc),
+        "split_file": str(split_file),
+        "hr_plus_root": str(hr_plus_root),
+        "hr_plus_scale": int(hr_plus_scale),
+        "beam_size": int(beam_size),
+        "prefer_template": prefer_template,
+        "val": {},
+        "test": {},
+    }
+
+    if best_ckpt.exists():
+        ck = torch.load(best_ckpt, map_location=device)
+        model.load_state_dict(ck["model"])
+        model.eval()
+
+        def _run_eval(loader, split_name: str) -> Tuple[dict, list]:
+            all_gt2 = []
+            pred_g = []
+            pred_c = []
+            with torch.no_grad():
+                for images, _targets, _tlen, labels in tqdm(loader, desc=f"[OCR] eval {split_name}"):
+                    images = images.to(device)
+                    with autocast(device_type="cuda", enabled=use_amp):
+                        log_probs = model(images)
+
+                    greedy_ids = torch.argmax(log_probs, dim=2).cpu().tolist()
+                    for seq in greedy_ids:
+                        pred = []
+                        last = None
+                        for s in seq:
+                            if s != 0 and s != last:
+                                pred.append(cfg.idx2char.get(s, ""))
+                            last = s
+                        pred_g.append(strip_chars("".join(pred), cfg.eval_strip_chars))
+
+                    constrained2 = decode_with_plate_constraints(
+                        log_probs.cpu(),
+                        idx2char=cfg.idx2char,
+                        beam_size=int(beam_size),
+                        prefer_template=prefer_template,
+                        eval_strip=cfg.eval_strip_chars,
+                    )
+                    pred_c.extend(constrained2)
+
+                    for gt in labels:
+                        all_gt2.append(strip_chars(gt, cfg.eval_strip_chars))
+
+            summary = {
+                "greedy": _summarize(pred_g, all_gt2),
+                "constrained": _summarize(pred_c, all_gt2),
+            }
+            samples2 = []
+            for i in range(min(50, len(all_gt2))):
+                samples2.append({"gt": all_gt2[i], "pred_greedy": pred_g[i], "pred_constrained": pred_c[i]})
+            return summary, samples2
+
+        val_summary, _ = _run_eval(val_loader, "val")
+        eval_summary["val"] = val_summary
+
+        if test_loader is not None:
+            test_summary, test_samples = _run_eval(test_loader, "test")
+            eval_summary["test"] = test_summary
+            with open(out_dir / "test_samples.json", "w", encoding="utf-8") as f:
+                json.dump(test_samples, f, indent=2)
+
+        with open(out_dir / "eval_summary.json", "w", encoding="utf-8") as f:
+            json.dump(eval_summary, f, indent=2)
+
     return {
         "best_ckpt": str(best_ckpt),
         "metrics_csv": str(metrics_path),
+        "eval_summary": str(out_dir / "eval_summary.json"),
         "out_dir": str(out_dir),
     }
